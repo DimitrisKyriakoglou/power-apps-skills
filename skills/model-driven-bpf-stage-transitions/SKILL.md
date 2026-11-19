@@ -1,203 +1,347 @@
 ---
 name: model-driven-bpf-stage-transitions
-description: Best-practice pattern for handling Business Process Flow (BPF) stage transitions in a model-driven app form with JavaScript. Use when writing OnLoad / OnPreStageChange / OnStageChange / OnProcessStatusChange logic, validating moves between BPF stages, or adding per-transition handlers. Generic, not tied to any application.
+description: Pattern for planning and writing Business Process Flow (BPF) stage transition logic in a model-driven app form with JavaScript, using one declarative transition table plus one dispatcher. Use when planning or documenting BPF business rules, writing OnLoad / OnPreStageChange / OnStageChange / OnProcessStatusChange logic, validating or blocking moves between stages, adding or changing a transition, or explaining how a BPF works. Generic, not tied to any application.
 ---
 
-# Model-Driven App: BPF Stage Transition Pattern
+# Model-Driven App: BPF Stage Transitions
 
-A registry-based pattern: **two classes -> register stages -> register routes -> register transition handlers -> dispatch on stage change.** Replaces large if/else chains in the stage-change event with small, testable, per-transition functions.
+**One table describes every allowed move. One dispatcher enforces it.** A move that is not in the table is blocked. Business people can read and approve the table; developers implement it row by row.
 
-## 1. Two classes
+Use this skill for every BPF: planning the rules, writing the code, reviewing it, and explaining it to someone new.
+
+---
+
+## 1. How a BPF stage move works (plain words)
+
+A **Business Process Flow** is the chevron bar at the top of a form. Each chevron is a **stage**. A **transition** is a move from one stage to another, forward ("Next Stage") or back ("Previous Stage").
+
+When the user clicks, the platform fires events in this order:
+
+| Order | Event | When | What you can do |
+|---|---|---|---|
+| 1 | `OnPreStageChange` | **Before** the move | Validate, set field values, **cancel** the move (`preventDefault`). Do not save here. |
+| 2 | (platform) | | The BPF performs and saves its own stage move |
+| 3 | `OnStageChange` | **After** the move | Save the record, navigate, refresh UI. Cannot cancel. |
+| 4 | `OnProcessStatusChange` | When the whole process finishes or is abandoned | Final validation, write the "completed" status |
+
+Every stage is identified by a **GUID**. The code compares GUIDs, never stage names.
+
+---
+
+## 2. Step 1: Plan the transitions (before any code)
+
+Write one row per direction. Forward and return moves are separate rows. Every row answers the same questions, in business language, so non-developers can review it:
+
+| # | From | To | Who may do it | Action to select first | Validations (all must pass) | Fields updated |
+|---|---|---|---|---|---|---|
+| 1 | New | Review | Requestor, Admin | Submit for Review | progress not "Not Started"; due date set | stage, status, submitted-on date |
+| 2 | Review | Completion | Responsible, Admin | Submit for Completion | evidence note exists | stage, status |
+| 3 | Review | New | Responsible, Admin | Return for Info | return comment filled | stage, status, clear action |
+| 4 | Completion | Review | Requestor, Admin | Return for Info | none | stage, status |
+
+Rules for the plan:
+
+- Rows can have different numbers of validations and different updated fields. Do not force them to match.
+- Any move not listed is **not allowed**. Confirm this with the business owner explicitly.
+- List who may act per transition, not per stage. The same stage can be left by different roles in different directions.
+- Keep this table in the project documentation. The code table in step 4 mirrors it one-to-one.
+- Also note what changes **inside** each stage (which fields are locked, required or hidden). That is stage behaviour, covered in section 6, not a transition.
+
+---
+
+## 3. Step 2: Constants
+
+Name every value once. Never use raw GUIDs or numbers inline.
 
 ```js
-// StageRouter: knows which stages exist and which moves are legal.
-class StageRouter {
-  constructor() {
-    this.stages = new Map();
-    this.routes = new Map();
-  }
-  addStage(stage) {
-    if (!stage || !stage.id) {
-      console.error("Stage must have an 'id' property");
-      return;
-    }
-    this.stages.set(stage.id, stage);
-  }
-  addRoute(fromId, toId) {
-    if (!this.routes.has(fromId)) this.routes.set(fromId, new Set());
-    this.routes.get(fromId).add(toId);
-  }
-  addBidirectionalRoute(id1, id2) {
-    this.addRoute(id1, id2);
-    this.addRoute(id2, id1);
-  }
-  isAllowed(fromId, toId) {
-    return this.routes.has(fromId) && this.routes.get(fromId).has(toId);
-  }
+// BPF stage ids (lower-case, no braces)
+const BPF_STAGE_A = "<stage-guid>";
+const BPF_STAGE_B = "<stage-guid>";
+
+// Choice option values (numbers) for the stage and status columns
+const STAGE_CHOICE_A = 100000000;
+const STAGE_CHOICE_B = 100000001;
+const STATUS_SUBMITTED = 100000000;
+
+// Choice option values for the BPF action control
+const ACTION_SUBMIT = 100000000;
+const ACTION_RETURN = 100000001;
+```
+
+If the table has a "current stage" Choice column, keep a lookup from its numeric value to the BPF stage GUID (see section 7, Stages and GUIDs).
+
+---
+
+## 4. Step 3: The transition table
+
+```js
+// Every allowed stage transition. Key = "fromStageId->toStageId". A move NOT listed here is blocked.
+// canMove is a FUNCTION: role flags (isRequestor, ...) are set in onLoad, after this table is created.
+const TRANSITIONS = {
+  // 1. A -> B
+  [`${BPF_STAGE_A}->${BPF_STAGE_B}`]: {
+    canMove: () => isRequestor || isSystemAdmin,
+    requiredAction: ACTION_SUBMIT,
+    validations: [
+      validateProgressNotStarted,
+      requireField("xgh_duedate", "Due Date"),
+    ],
+    updates: {
+      xgh_stage: STAGE_CHOICE_B,
+      xgh_status: STATUS_SUBMITTED,
+      xgh_submittedon: () => new Date(), // a function value is computed at transition time
+    },
+  },
+  // 2. B -> A (return)
+  [`${BPF_STAGE_B}->${BPF_STAGE_A}`]: {
+    canMove: () => isResponsible || isSystemAdmin,
+    requiredAction: ACTION_RETURN,
+    validations: [requireField("xgh_returncomment", "Return Comment")],
+    updates: {
+      xgh_stage: STAGE_CHOICE_A,
+      xgh_status: STATUS_RETURNED,
+      xgh_action: null, // clear the action for the stage being entered
+    },
+  },
+};
+```
+
+### Row fields
+
+| Field | Required | Meaning |
+|---|---|---|
+| `canMove` | yes | Function returning true if the current user may make this move |
+| `requiredAction` | no | Option the user must select in the BPF first. Omit if none |
+| `validations` | no | Array of synchronous checks. Omit or `[]` for none |
+| `updates` | no | `{ logicalName: value }`. Any number of fields. A function value is evaluated at transition time (dates, current user) |
+| `apply` | no | `(ctx) => {}` run after `updates` for logic a field map cannot express. Use rarely |
+| `label` | no | Destination name for messages |
+
+### Validations
+
+A validation returns `null` when it passes, or a message string when it fails. It never shows UI itself, so the dispatcher can collect every failure and show them in one message.
+
+```js
+function validateProgressNotStarted() {
+  const v = form.progressStatusAttr.getValue();
+  return v === null || v === PROGRESS_NOT_STARTED ? "The Progress Status cannot be 'Not Started'." : null;
 }
 
-// TransitionHandler: knows what to validate/do for each specific move.
-class TransitionHandler {
-  constructor() {
-    this.handlers = new Map();
-  }
-  register(fromId, toId, handler) {
-    if (typeof handler !== "function") {
-      console.error("Transition handler must be a function");
-      return;
-    }
-    this.handlers.set(`${fromId}->${toId}`, handler);
-  }
-  // ctx = { formContext, eventArgs, fromId, toId } passed explicitly to handlers
-  handle(fromId, toId, ctx) {
-    const handler = this.handlers.get(`${fromId}->${toId}`);
-    if (!handler) {
-      console.error(`No transition handler defined from ${fromId} to ${toId}`);
-      return false; // fail closed
-    }
-    return handler(ctx);
-  }
-}
-
-const stageRouter = new StageRouter();
-const transitionHandler = new TransitionHandler();
-```
-
-## 2. Add stages
-
-Use the BPF stage GUIDs (`formContext.data.process.getActiveStage().getId()`) held in named constants, never inline.
-
-```js
-const STAGE_A = "<stage-guid>";
-const STAGE_B = "<stage-guid>";
-const STAGE_C = "<stage-guid>";
-
-stageRouter.addStage({ id: STAGE_A, name: "Stage A" });
-stageRouter.addStage({ id: STAGE_B, name: "Stage B" });
-stageRouter.addStage({ id: STAGE_C, name: "Stage C" });
-```
-
-## 3. Add routes
-
-Declare only the moves that are legal. Anything not declared is blocked.
-
-```js
-stageRouter.addBidirectionalRoute(STAGE_A, STAGE_B); // forward and back
-stageRouter.addRoute(STAGE_B, STAGE_C);              // forward only
-```
-
-## 4. Transition logic (one handler per from->to pair)
-
-Handlers receive context, validate, mutate fields, and return a result. Keep each handler to one transition.
-
-```js
-transitionHandler.register(STAGE_A, STAGE_B, (ctx) => {
-  const { formContext, eventArgs } = ctx;
-  if (!formContext.getAttribute("some_field").getValue()) {
-    preventTransition(eventArgs, "Please fill in Some Field before continuing.");
-    return false;
-  }
-  // set fields / status for the new stage here
-  return true;
-});
-
-transitionHandler.register(STAGE_B, STAGE_A, (ctx) => {
-  const { formContext, eventArgs } = ctx;
-  if (formContext.getAttribute("action").getValue() !== ACTION_RETURN) {
-    preventTransition(eventArgs, "Select the Return action to go back.");
-    return false;
-  }
-  return true;
-});
-```
-
-Shared helper:
-
-```js
-function preventTransition(eventArgs, message) {
-  eventArgs.preventDefault();
-  Xrm.Navigation.openAlertDialog({ title: "Warning", text: message });
+// Reusable factory: write a common check once, use it in many rows
+function requireField(attributeName, label) {
+  return () => {
+    const attr = formContext.getAttribute(attributeName);
+    const v = attr && attr.getValue();
+    return v === null || v === undefined || v === "" ? `${label} is required.` : null;
+  };
 }
 ```
 
-## 5. Dispatch on stage change
+Validations must be synchronous. If a check needs a Web API call, prefetch the data on load or on field change and read it from a variable (see Async limits in section 8).
 
-Register on form **OnLoad**, passing the execution context.
+---
+
+## 5. Step 4: The dispatcher (the only place the table is read)
+
+Register on form `OnLoad`. Use named functions and remove before add, so a repeated `onLoad` never stacks duplicates.
 
 ```js
 function onLoad(executionContext) {
-  const formContext = executionContext.getFormContext();
+  formContext = executionContext.getFormContext();
+  formContext.data.process.removeOnPreStageChange(onPreStageChange);
   formContext.data.process.addOnPreStageChange(onPreStageChange);
+  formContext.data.process.removeOnStageChange(onStageChange);
+  formContext.data.process.addOnStageChange(onStageChange);
+  formContext.data.process.removeOnProcessStatusChange(onProcessStatusChange);
   formContext.data.process.addOnProcessStatusChange(onProcessStatusChange);
 }
 
-function onPreStageChange(executionContext) {
-  const formContext = executionContext.getFormContext();
-  const eventArgs = executionContext.getEventArgs();
+function preventStageTransition(eventArgs, message) {
+  eventArgs.preventDefault();
+  showUserErrorMessage(message);
+}
 
-  const fromId = formContext.data.process.getActiveStage().getId();
-  // OnPreStageChange event args expose getStage() (the stage being moved TO) and getDirection().
-  // There is NO getDestinationStage() in the Client API - calling it throws.
-  const toId = eventArgs.getStage().getId();
+function onPreStageChange(execContext) {
+  const eventArgs = execContext.getEventArgs();
+  try {
+    const fromId = getActiveStageId();
+    // getStage() is the stage being moved TO. There is no getDestinationStage() in the Client API.
+    const destination = eventArgs.getStage();
+    const toId = destination ? normalizeGuid(destination.getId()) : null;
 
-  // Optional: only handle "next"/"previous" direction if needed
-  // const dir = eventArgs.getDirection(); // "Next" | "Previous"
-
-  if (!stageRouter.isAllowed(fromId, toId)) {
-    preventTransition(eventArgs, "You cannot move to this stage.");
-    return;
-  }
-
-  const ok = transitionHandler.handle(fromId, toId, { formContext, eventArgs, fromId, toId });
-  if (ok !== true) {
-    // Handler already called preventTransition for validation failures.
-    // Defensive: make sure a falsy result always blocks the move.
-    if (!eventArgs.getDefaultPrevented || !eventArgs.getDefaultPrevented()) {
-      eventArgs.preventDefault();
+    if (!fromId || !toId) {
+      preventStageTransition(eventArgs, "The current stage could not be determined. Please refresh the page.");
+      return;
     }
+
+    const rule = TRANSITIONS[`${fromId}->${toId}`];
+
+    // 1. Is the move allowed at all? Not in the table = blocked.
+    if (!rule) {
+      preventStageTransition(eventArgs, "You cannot move to this stage.");
+      return;
+    }
+    // 2. Is this user allowed?
+    if (!rule.canMove()) {
+      preventStageTransition(eventArgs, "You are not authorized to move to this stage.");
+      return;
+    }
+    // 3. Was the required action selected?
+    if (rule.requiredAction !== undefined && form.actionAttr.getValue() !== rule.requiredAction) {
+      preventStageTransition(
+        eventArgs,
+        `To make this move, please first select the action "${form.actionAttr.getOption(rule.requiredAction).text}".`
+      );
+      return;
+    }
+    // 4. Run ALL validations and report every failure in one message.
+    const errors = (rule.validations || []).map((check) => check()).filter(Boolean);
+    if (errors.length > 0) {
+      preventStageTransition(eventArgs, errors.join("\n"));
+      return;
+    }
+    // 5. Everything passed: apply updates LAST, so a blocked move leaves the form untouched.
+    //    setValue only marks fields dirty. The save happens in onStageChange.
+    Object.entries(rule.updates || {}).forEach(([name, value]) => {
+      const attr = formContext.getAttribute(name);
+      if (!attr) { console.error(`updates: attribute "${name}" is not on the form`); return; }
+      attr.setValue(typeof value === "function" ? value() : value);
+    });
+    if (rule.apply) rule.apply({ formContext, eventArgs });
+
+    // Do NOT save here. Flag the move; onStageChange saves.
+    stageTransitionApproved = true;
+  } catch (error) {
+    eventArgs.preventDefault(); // an exception must never let an unvalidated move through
+    showUserErrorMessage(
+      isSystemAdmin
+        ? `Stage transition error: ${error.message}`
+        : "An unexpected error occurred during stage transition. Please contact your administrator.",
+      error.stack || error.message
+    );
   }
+}
+
+// Runs after the BPF has completed its own move: save once, then navigate.
+function onStageChange() {
+  if (!stageTransitionApproved) return;
+  stageTransitionApproved = false;
+  formContext.data.save().then(
+    () => Xrm.Navigation.navigateTo({ pageType: "entitylist", entityName: "<table>" }),
+    (error) => showUserErrorMessage(
+      "The record could not be saved. Please try again or contact your administrator.",
+      (error && (error.message || error.stack)) || String(error)
+    ) // leave the form open for a retry; do not navigate away
+  );
 }
 ```
 
-Finish the process (last stage "Finish") in `onProcessStatusChange`, check `formContext.data.process.getStatus() === "finished"`, validate, and if invalid, call `formContext.data.process.setStatus("active")` to reopen it.
+Click-to-saved-record sequence: checks pass -> `updates` applied (dirty, unsaved) -> `stageTransitionApproved = true` -> BPF completes its move -> `onStageChange` saves once -> navigate after the save promise resolves.
 
-## Best practices
+### Finishing the process
 
-- **Pass context explicitly.** Handlers must receive `formContext` and `eventArgs` as arguments. Never rely on outer-scope variables or globals for them (they will be undefined or stale).
-- **Fail closed.** Unknown route or missing handler returns false and blocks the move. A missing handler is a configuration bug, so log it with `console.error`.
-- **One registry, one name.** Use a single handler instance consistently (a common bug is registering on one object and dispatching on another).
-- **Constants must match.** Route/handler registration and constants must use the same stage constants (watch for near-duplicate names like `STAGE_COMPLETION` vs `STAGE_COMPLETION_REQUEST`).
-- **`preventDefault` is only valid inside `OnPreStageChange`** (and OnPreProcessStatusChange). It cannot cancel `OnStageChange`.
-- **Async limits.** `OnPreStageChange` cannot await async work to decide cancellation. If a check needs a Web API call (e.g. "does a note exist?"), either prefetch the data on load / on field change and keep it in a variable, or cancel the move first, run the async check, then advance programmatically with `formContext.data.process.moveNext()` / `movePrevious()`. Do not assume a fire-and-forget fetch result is ready before the handler returns.
-- **Check security roles/ownership in the handler**, but also enforce it server-side (plug-in or business rule). Client JS is not a security boundary.
-- **Reset stage-specific fields** (action choice, etc.) in the handler for the stage you are entering so stale values do not carry over.
-- **Return values:** `true` = allowed, `false` = blocked. If you need richer outcomes (e.g. `"rejected"` -> save then close), use a documented set of string/enum results and handle each explicitly in the dispatcher.
-- **Delay `form.ui.close()`/navigation** until after save completes (use the promise from `formContext.data.save()`), not an arbitrary `setTimeout`.
-- **Never call `formContext.data.save()` inside `OnPreStageChange`.** The BPF saves the stage move itself; an extra save at that moment collides with it and shows a generic "The record could not be saved" error even though the stage move and field values were actually persisted. Inside `OnPreStageChange` only validate, set field values, and set a flag (e.g. `stageTransitionApproved = true`) - then do the save and any navigation/close in an `OnStageChange` handler (`addOnStageChange`), which runs after the BPF has finished its own move:
-  ```js
-  function onStageChange() {
-    if (!stageTransitionApproved) return;
-    stageTransitionApproved = false;
-    formContext.data.save().then(() => Xrm.Navigation.navigateTo({ pageType: "entitylist", entityName: "<table>" }));
-  }
-  ```
-- **Don't remove and re-add the `OnPreStageChange` handler from inside itself.** Register once on load (call `removeOnPreStageChange` before `addOnPreStageChange` there to avoid duplicates) and leave it registered.
-- **Verify control and attribute logical names against the real form before using them.** `getControl()` returns `null` for a name that is not on the form (and control names can differ from the field name, e.g. `xgh_actionpointnumber1`, `Subgrid_stakeholder`). One wrong name in a form-helper object makes the first `ctrl.setDisabled(...)` throw `Cannot read properties of null` and aborts the whole `onLoad`, so the BPF handlers never register and later errors look unrelated. List the real names from the browser console with `Xrm.Page.getControl().forEach(c => console.log(c.getName(), c.getLabel()))` and keep a form-helper that is checked once at load (log every null control) rather than discovering them one error at a time.
-- **An error message like `Cannot read properties of undefined (reading 'identifier')` that matches no text in your own code comes from Microsoft's own scripts.** Look for an earlier failure in your `onLoad` or a save/handler lifecycle problem in your code that left the BPF in an inconsistent state, rather than assuming a platform bug.
-- **A generic "An error has occurred" save failure does not say what failed.** Get the real cause from the failing request's response body (browser dev tools -> Network) or the Plug-in Trace Log for the dialog's Activity Id. Check whether the data was in fact saved before debugging the server.
-- **Use only the public Client API; never private properties.** Read stages with `getActiveStage().getId()` and `eventArgs.getStage().getId()`. Do not use `getActiveStage()._activeStageId` or `eventArgs._stage._stageStep.id`: they are undocumented, can be `undefined` while the BPF is still loading, and break on platform updates.
-- **Never busy-wait with `while (x === undefined) { try {...} catch {} }`.** It freezes the browser tab if the value never arrives. Read the stage once, null-check it, and if it is not ready retry with a bounded `setTimeout` (see the rendering-retry rule below), or fall back to a safe default.
-- **Normalize every GUID before comparing or using it as a map key.** Strip braces and lower-case: `id.replace(/[{}]/g, "").toLowerCase()`. Apply this to stage ids, record ids and user ids. Stage ids from `getId()`, from a string field and from constants differ in case/braces, and a raw comparison silently fails (route not found, handler not found).
-- **If you keep a "current stage" field on the table (a Choice column such as `xgh_stage`), map its numeric option value to the BPF stage GUID with a lookup object.** Do not store or compare a GUID in a Choice column.
-  - Keep two named constant sets: the Choice option values (numbers) and the BPF stage GUIDs, plus `CHOICE_TO_BPF_STAGE = { [VALUE]: GUID }`.
-  - Write the numeric value with `setValue(STAGE_CHOICE_X)`. Resolve the stage with one helper such as `resolveActiveStage()`: Choice number -> mapped GUID, then a string GUID if present, then `getActiveStage().getId()`.
-  - The field is empty on a brand-new record, so the helper must fall back to the active BPF stage. Otherwise all stage logic (required levels, visibility) is skipped on create.
-- **BPF header controls render after `OnLoad` runs.** `getControl("header_process_<field>")` can return `null` on first call. Do not assume it is there: collect the controls, and if any is missing retry with a bounded `setTimeout` (for example 300 ms x 20) and then give up quietly. Reset the retry counter once they are found.
-- **Show/hide BPF action controls by stage only; express role restrictions with `setDisabled`.** Hide all stage controls first, then show only the control of the active stage. Use `setDisabled(!(hasRole || isAdmin))` for users who may not act, rather than hiding it. Hiding by role makes a stage look empty or broken for everyone else. Also restrict a shared option set per stage (for example only "Submit" in stage 1, only "Complete" or "Return" in the last) with a helper such as `restrictActionOptions(control, allowedValues)`.
-- **Register all BPF handlers idempotently on load:** call `removeOnX(handler)` immediately before `addOnX(handler)` for `OnPreStageChange`, `OnStageChange` and `OnProcessStatusChange`. Use the same named function reference for add and remove (not an inline closure), so repeated `onLoad` calls (form refresh, tab switch) never stack duplicates.
-- **Do not overwrite a module-level `executionContext` inside event handlers.** Each event gets its own execution context, so use a local `const` (`execContext.getEventArgs()`, `execContext.getFormContext()`) and pass it on. Reassigning the shared global from the stage handler makes later code use a stale or wrong context.
-- **Wrap each stage handler in `try/catch` that cancels the move on error.** In the `catch`, call `eventArgs.preventDefault()` and show the error, so an unexpected exception never lets an unvalidated transition through. Show `error.message` only to administrators; give other users a generic message plus a contact hint.
-- **Use one `showUserErrorMessage(message, technicalDetails)` helper for every user-facing error.** Call `Xrm.Navigation.openErrorDialog({ message, details })`. Passing `details` enables the dialog's "Download Log File" button. Build the details from a session error log (timestamp, record id, user id, active stage, role names, URL, the current error and its stack, and earlier session errors). This makes support requests self-diagnosing. Always pass `error.stack || error.message` from `catch` blocks.
-- **When a transition handler reverts a field, make the rollback explicit.** If a post-stage save fails, tell the user the record was not saved and leave the form open for a retry. Do not navigate away.
-- **Namespace the code** (e.g. `MyApp.Form`) and expose only `onLoad` to the form event registration; pass execution context ("Pass execution context as first parameter" checked).
-- **Keep handlers small.** Extract shared checks (role check, required-note check) into helpers rather than copying them across handlers.
+Handle the last stage's "Finish" in `onProcessStatusChange`: check `formContext.data.process.getStatus() === "finished"`, validate, and if invalid call `formContext.data.process.setStatus("active")` to reopen. A "completed" status written when the whole process finishes belongs here, not in the transition table.
+
+---
+
+## 6. Stage behaviour (separate from transitions)
+
+Transitions decide *whether you may leave* a stage. **Stage behaviour** decides how the form looks *while in* a stage: locked fields, required fields, visible controls, allowed action options. Keep it in one function, `applyStageBehaviour()`, with one `switch` on the active stage, called on load and after each stage change.
+
+- Show or hide BPF action controls **by stage only**. Hide all first, then show the active stage's control.
+- Express role limits with `setDisabled(!(hasRole || isAdmin))`, not by hiding. Hiding by role makes a stage look empty to everyone else.
+- Restrict a shared option set per stage with a helper such as `restrictActionOptions(control, allowedValues)`.
+- BPF header controls render after `OnLoad`. `getControl("header_process_<field>")` can be `null` at first. Retry with a bounded `setTimeout` (for example 300 ms x 20), then give up quietly; reset the counter once found.
+
+---
+
+## 7. Stages and GUIDs
+
+- **Normalize every GUID** before comparing or using it as a key: `id.replace(/[{}]/g, "").toLowerCase()`. Apply this to stage ids, record ids and user ids. Raw GUIDs differ in case and braces, and a raw comparison silently fails (the transition is "not found").
+- **Use only the public Client API.** Read stages with `getActiveStage().getId()` and `eventArgs.getStage().getId()`. Never use `_activeStageId` or `_stage._stageStep.id`: they are undocumented, can be `undefined` while the BPF loads, and break on platform updates.
+- **Current-stage Choice column** (e.g. `xgh_stage`): map its numeric option value to the BPF stage GUID with a lookup object. Never store or compare a GUID in a Choice column.
+  - Keep two constant sets (Choice numbers and BPF GUIDs) plus `CHOICE_TO_BPF_STAGE = { [VALUE]: GUID }`.
+  - Resolve the stage with one helper, `resolveActiveStage()`: Choice number -> mapped GUID, then a string GUID if present, then `getActiveStage().getId()`.
+  - The column is empty on a new record, so the helper must fall back to the active BPF stage; otherwise all stage behaviour is skipped on create.
+- **Never busy-wait** (`while (x === undefined) {...}`): it freezes the tab. Read once, null-check, and retry with a bounded `setTimeout` or use a safe default.
+
+---
+
+## 8. Rules that prevent the common failures
+
+### Correctness
+- **Fail closed.** Not in `TRANSITIONS` means blocked. Never add a "default allow".
+- **`canMove` is a function, not a value.** A value would freeze role flags as `false` at definition time.
+- **Constants must match.** Watch near-duplicates such as `STAGE_COMPLETION` vs `STAGE_COMPLETION_REQUEST`. A typo silently makes a move "not allowed".
+- **Apply `updates` only after every check passes.**
+- **Reset stage-specific fields** (action choice, etc.) for the stage being entered, in `updates`, so stale values do not carry over.
+- **Client JS is not a security boundary.** Check roles in `canMove`, and enforce the same rule server-side (plug-in or business rule).
+
+### Events and saving
+- **`preventDefault` works only in `OnPreStageChange`** (and `OnPreProcessStatusChange`). It cannot cancel `OnStageChange`.
+- **Never call `formContext.data.save()` inside `OnPreStageChange`.** The BPF saves its own move; a second save collides and shows a generic "The record could not be saved" error even though the data was persisted. Validate, set values, set the flag, then save in `onStageChange`.
+- **Wait for the save promise** before `form.ui.close()` or navigation. Never use an arbitrary `setTimeout`.
+- **Register once, idempotently.** Same named function for `removeOnX` and `addOnX`; never register or unregister from inside the handler itself.
+- **Async limits.** `OnPreStageChange` cannot await. For a Web API check, either prefetch on load / field change and keep the result in a variable, or cancel the move, run the async check, then advance with `formContext.data.process.moveNext()` / `movePrevious()`. A fire-and-forget fetch is not ready when the handler returns.
+- **Richer outcomes** than allow/block (for example "rejected" -> save then close): use a documented set of enum results and handle each explicitly in the dispatcher.
+
+### Context
+- **Use each event's own execution context.** Take `getEventArgs()` and `getFormContext()` from the `execContext` argument. Never overwrite a shared module-level `executionContext` inside event handlers; it goes stale.
+- **Namespace the code** (e.g. `MyApp.Form`) and register only `onLoad` on the form, with "Pass execution context as first parameter" checked.
+
+### Errors and support
+- **Wrap each stage event in `try/catch` that cancels the move** (`preventDefault`) and shows the error. Show `error.message` to administrators only; others get a generic message plus a contact hint.
+- **One `showUserErrorMessage(message, technicalDetails)` helper** for every user-facing error, calling `Xrm.Navigation.openErrorDialog({ message, details })`. Passing `details` enables "Download Log File". Build details from a session error log: timestamp, record id, user id, active stage, role names, URL, current error and stack, earlier session errors. Always pass `error.stack || error.message` from `catch`.
+- **Failed post-stage save:** tell the user the record was not saved, leave the form open, do not navigate.
+
+### Troubleshooting
+- **Verify control and attribute logical names against the real form.** `getControl()` returns `null` for a wrong name, and control names can differ from field names (e.g. `xgh_actionpointnumber1`, `Subgrid_stakeholder`). One wrong name makes the first `ctrl.setDisabled(...)` throw `Cannot read properties of null`, aborts `onLoad`, and the BPF handlers never register, so later errors look unrelated. List real names in the browser console: `Xrm.Page.getControl().forEach(c => console.log(c.getName(), c.getLabel()))`. Keep a form helper that checks them once at load and logs every null.
+- **`Cannot read properties of undefined (reading 'identifier')`** with no matching text in your code comes from Microsoft's scripts. Look for an earlier failure in your `onLoad` or a save/handler lifecycle problem that left the BPF inconsistent; do not assume a platform bug.
+- **A generic "An error has occurred" on save** does not say what failed. Read the failing request's response body (dev tools -> Network) or the Plug-in Trace Log for the Activity Id. Check whether the data was in fact saved before debugging the server.
+
+---
+
+## 9. Recipes
+
+### Add a new transition
+1. Add a row to the plan table (section 2) and get it approved.
+2. Add the BPF stage constants if the stage is new.
+3. Add one entry to `TRANSITIONS` mirroring the row. Reuse existing validation functions and factories.
+4. Add any new validation as a function returning `null` or a message.
+5. Run the test matrix below for the new row.
+
+### Change a rule
+Edit the one row. Nothing else should need to change; if it does, the logic is in the wrong place.
+
+---
+
+## 10. Test matrix
+
+Test every row of the table, plus the blocked cases:
+
+| Case | Expected |
+|---|---|
+| Each listed move, correct role, correct action, all validations pass | Allowed; `updates` applied; saved once; navigates |
+| Each listed move, wrong role | Blocked: not authorized; no field changed |
+| Each listed move, wrong or missing action | Blocked: names the required action; no field changed |
+| Each listed move, one validation failing | Blocked; message shows that failure |
+| Each listed move, several validations failing | Blocked; **all** failures shown in one message |
+| A move not in the table (e.g. skip a stage) | Blocked: cannot move to this stage |
+| Administrator | Allowed where `canMove` includes admin |
+| Save fails after an allowed move | Error shown with details; form stays open |
+| Reload the form twice | Handlers fire once per move (no duplicates) |
+| Brand-new record | Stage behaviour resolves from the active BPF stage; no errors |
+
+---
+
+## 11. Review checklist
+
+- Table matches the approved plan, row for row.
+- Every key uses constants; GUIDs normalized.
+- `canMove` is a function in every row.
+- Validations return messages and show no UI; none is async.
+- `updates` field names exist on the form.
+- No `save()` in `OnPreStageChange`; save and navigation in `OnStageChange`.
+- Handlers registered with remove-then-add, named functions.
+- `try/catch` cancels the move; errors go through `showUserErrorMessage` with details.
+- Roles also enforced server-side.
